@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Minimal stlink-server replacement: lets Keil uVision (under Wine, "Shareable ST-Link"
+mode) reach a real ST-Link via libusb. Protocol per OpenOCD stlink_usb.c (tcp backend)
+plus quirks of ST's STLinkUSBDriver.dll (75-byte device info, non-zero device id)."""
+import ctypes as C, socket, struct, sys, threading
+
+PORT = int(next((a.split('=')[1] for a in sys.argv if a.startswith('--port=')), 7184))
+OK, TIMEOUT, BAD_PARAM, OPEN_ERR, NOT_AVAIL = 0x1, 0x1001, 0x1002, 0x1003, 0x1053
+PIDS = {0x3748: (0x02, 0x81, 0x83)}  # V2; V2-1/V3 below
+for p in (0x374B, 0x374E, 0x374F, 0x3752, 0x3753, 0x3754, 0x3757):
+    PIDS[p] = (0x01, 0x81, 0x82)
+VERBOSE = '-v' in sys.argv
+
+usb = C.CDLL('libusb-1.0.so.0')
+usb.libusb_get_device_list.argtypes = [C.c_void_p, C.POINTER(C.POINTER(C.c_void_p))]
+usb.libusb_get_device_list.restype = C.c_ssize_t
+usb.libusb_open.argtypes = [C.c_void_p, C.POINTER(C.c_void_p)]
+usb.libusb_get_device_descriptor.argtypes = [C.c_void_p, C.c_char_p]
+usb.libusb_free_device_list.argtypes = [C.c_void_p, C.c_int]
+usb.libusb_close.argtypes = [C.c_void_p]
+usb.libusb_claim_interface.argtypes = [C.c_void_p, C.c_int]
+usb.libusb_release_interface.argtypes = [C.c_void_p, C.c_int]
+usb.libusb_bulk_transfer.argtypes = [C.c_void_p, C.c_ubyte, C.c_char_p, C.c_int, C.POINTER(C.c_int), C.c_uint]
+usb.libusb_control_transfer.argtypes = [C.c_void_p, C.c_ubyte, C.c_ubyte, C.c_ushort, C.c_ushort, C.c_char_p, C.c_ushort, C.c_uint]
+usb.libusb_clear_halt.argtypes = [C.c_void_p, C.c_ubyte]
+usb.libusb_init(None)
+
+lock = threading.RLock()
+devs = []        # [{'id','serial','pid','eps','h'}]
+owners = {}      # connect_id -> dev
+next_cid = [1]
+
+
+def log(*a):
+    if VERBOSE:
+        print(*a, file=sys.stderr, flush=True)
+
+
+def serial_of(h, idx):
+    buf = C.create_string_buffer(255)
+    n = usb.libusb_control_transfer(h, 0x80, 6, (3 << 8) | idx, 0x0409, buf, 255, 1000)
+    if n < 2:
+        return ''
+    raw = buf.raw[2:n:2]  # low byte of each UTF-16 char
+    s = raw.decode('latin1')
+    return s if s.isalnum() and s.isascii() else raw.hex().upper()
+
+
+def refresh():
+    global devs
+    lst = C.POINTER(C.c_void_p)()
+    n = usb.libusb_get_device_list(None, C.byref(lst))
+    found = []
+    for i in range(max(n, 0)):
+        d = C.create_string_buffer(18)
+        usb.libusb_get_device_descriptor(lst[i], d)
+        vid, pid = struct.unpack_from('<HH', d.raw, 8)
+        if vid != 0x0483 or pid not in PIDS:
+            continue
+        old = next((x for x in devs if x['h'] and x['dev'] == lst[i]), None)
+        if old:
+            found.append(old)
+            continue
+        h = C.c_void_p()
+        if usb.libusb_open(lst[i], C.byref(h)) != 0:
+            log('open failed (permissions?)')
+            continue
+        found.append({'dev': lst[i], 'serial': serial_of(h, d.raw[16]), 'pid': pid,
+                      'eps': PIDS[pid], 'h': h, 'claimed': False})
+    for x in devs:
+        if x not in found and x['h']:
+            usb.libusb_close(x['h'])
+    for i, x in enumerate(found):
+        x['id'] = i + 1  # ST DLL rejects id 0
+    devs = found
+    log('devices:', [(x['serial'], hex(x['pid'])) for x in devs])
+
+
+def bulk(h, ep, data_or_len):
+    n = C.c_int()
+    if isinstance(data_or_len, int):
+        buf = C.create_string_buffer(max(data_or_len, 1))
+        r = usb.libusb_bulk_transfer(h, ep, buf, data_or_len, C.byref(n), 3000)
+        return r, buf.raw[:n.value]
+    r = usb.libusb_bulk_transfer(h, ep, data_or_len, len(data_or_len), C.byref(n), 3000)
+    return r, b''
+
+
+def usb_cmd(dev, cmd, direction, size, wdata):
+    h = dev['h']
+    out, inp, trace = dev['eps']
+    pad = b'' if direction == 0 else b'\0' * size
+    if not dev['claimed']:
+        if usb.libusb_claim_interface(h, 0) != 0:
+            return OPEN_ERR, pad
+        for ep in dev['eps']:
+            usb.libusb_clear_halt(h, ep)
+        dev['claimed'] = True
+    steps = []
+    if direction != 3:  # SWO read sends no command
+        steps.append((out, cmd))
+    if direction == 0 and size:
+        steps.append((out, wdata))
+    if direction != 0 and size:
+        steps.append((trace if direction == 3 else inp, size))
+    data = b''
+    for ep, arg in steps:
+        r, data = bulk(h, ep, arg)
+        if r:
+            log('usb err', r, 'ep', hex(ep))
+            if r == -9:  # stall: clear so next command works
+                usb.libusb_clear_halt(h, ep)
+            return TIMEOUT, pad
+    return OK, (b'' if direction == 0 else data.ljust(size, b'\0'))
+
+
+def recv_exact(s, n):
+    b = b''
+    while len(b) < n:
+        c = s.recv(n - len(b))
+        if not c:
+            raise ConnectionError
+        b += c
+    return b
+
+
+def u32(*v):
+    return struct.pack('<%dI' % len(v), *v)
+
+
+def handle(s):
+    mine = set()
+    try:
+        while True:
+            req = s.recv(65536)
+            if not req:
+                break
+            op = req[0]
+            if op == 5:  # SEND_USB_CMD
+                req += recv_exact(s, max(0, 32 - len(req)))
+                cid, = struct.unpack_from('<I', req, 4)
+                direction = req[24]
+                size, = struct.unpack_from('<I', req, 28)
+                if direction == 0:
+                    req += recv_exact(s, max(0, 32 + size - len(req)))
+                with lock:
+                    dev = owners.get(cid)
+                    if not dev:
+                        st, data = BAD_PARAM, b'\0' * (0 if direction == 0 else size)
+                    else:
+                        st, data = usb_cmd(dev, req[8:24], direction, size, req[32:32 + size])
+                log('usb', req[8:24].hex(), 'dir', direction, 'n', size, '->', hex(st), data[:16].hex())
+                s.sendall(u32(st) + data)
+                continue
+            log('req', req.hex())
+            with lock:
+                if op == 6:    # GET_SERVER_VERSION -> api, major, minor, build
+                    resp = u32(3, 2, 1, 0)
+                elif op == 0:  # REFRESH_DEVICE_LIST
+                    refresh(); resp = u32(OK)
+                elif op == 1:  # GET_NB_DEV
+                    resp = u32(len(devs))
+                elif op == 2:  # GET_DEV_INFO
+                    idx = req[1]
+                    size = struct.unpack_from('<I', req.ljust(8, b'\0'), 4)[0] or 41
+                    if idx >= len(devs):
+                        resp = u32(BAD_PARAM) + b'\0' * size
+                    else:
+                        d = devs[idx]
+                        info = (u32(d['id']) + d['serial'].encode()[:32].ljust(32, b'\0')
+                                + struct.pack('<HHB', 0x0483, d['pid'], 0))
+                        resp = u32(OK) + info.ljust(size, b'\0')[:size]  # extra fields zero (= not in use)
+                elif op == 3:  # OPEN_DEV: [op,0,0,0][device id][access mode (ST DLL only)]
+                    did, = struct.unpack_from('<I', req.ljust(8, b'\0'), 4)
+                    d = next((x for x in devs if x['id'] == did), None)
+                    if not d:
+                        refresh(); d = next((x for x in devs if x['id'] == did), None)
+                    if d:
+                        cid = next_cid[0]; next_cid[0] += 1
+                        owners[cid] = d; mine.add(cid)
+                        resp = u32(OK, cid)
+                    else:
+                        resp = u32(OPEN_ERR, 0)
+                elif op == 4:  # CLOSE_DEV
+                    cid, = struct.unpack_from('<I', req.ljust(8, b'\0'), 4)
+                    owners.pop(cid, None); mine.discard(cid)
+                    resp = u32(OK)
+                elif op == 7:  # GET_NB_OF_DEV_CLIENTS
+                    resp = u32(OK, 1)
+                else:
+                    log('unknown op', op)
+                    resp = u32(NOT_AVAIL)
+            log('resp', resp.hex())
+            s.sendall(resp)
+    except (ConnectionError, OSError):
+        pass
+    finally:
+        with lock:
+            for cid in mine:
+                owners.pop(cid, None)
+        s.close()
+
+
+def serve(srv):
+    while True:
+        c, _ = srv.accept()
+        c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
+
+
+def main():
+    socks = []
+    for fam, addr in ((socket.AF_INET, '127.0.0.1'), (socket.AF_INET6, '::1')):
+        try:
+            srv = socket.socket(fam, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((addr, PORT)); srv.listen(); socks.append(srv)
+        except OSError as e:
+            print(f'skip {addr}: {e}', file=sys.stderr)
+    print(f'stlink-tcp-bridge listening on localhost:{PORT}', file=sys.stderr, flush=True)
+    for srv in socks[1:]:
+        threading.Thread(target=serve, args=(srv,), daemon=True).start()
+    serve(socks[0])
+
+
+if __name__ == '__main__':
+    main()

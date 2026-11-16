@@ -1,0 +1,9 @@
+[Unit]
+Description=ST-Link TCP bridge for Keil under Wine (stlink-server replacement)
+
+[Service]
+ExecStart=%h/.local/bin/stlink-tcp-bridge
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

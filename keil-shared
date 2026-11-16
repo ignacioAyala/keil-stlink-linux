@@ -1,0 +1,14 @@
+#!/bin/sh
+# Turn on "Shareable ST-Link" in Keil project(s) (stored as -I2 in the .uvoptx).
+# Usage: keil-shared <project.uvprojx|project.uvoptx|dir>...   (close the project in Keil first)
+[ $# -gt 0 ] || { echo "usage: $0 <project.uvprojx|.uvoptx|dir>..." >&2; exit 1; }
+for a in "$@"; do
+  case $a in *.uvprojx) a=${a%.uvprojx}.uvoptx ;; esac
+  find "$a" -name '*.uvoptx' | while IFS= read -r f; do
+    if grep -q 'ST-LINKIII-KEIL_SWO' "$f"; then
+      sed -i '/ST-LINKIII-KEIL_SWO/,/<\/Name>/ s/ -I[0-9]* / -I2 /' "$f" && echo "shared mode on: $f"
+    else
+      echo "skip $f: no ST-Link settings yet (select ST-Link Debugger in Keil once)"
+    fi
+  done
+done
