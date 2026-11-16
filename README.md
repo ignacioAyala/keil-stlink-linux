@@ -1,4 +1,4 @@
-# keil-stlink-wine
+# keil-stlink-linux
 
 **Flash and debug STM32 boards with Keil µVision on Linux.** Keil runs under Wine, and an ST-Link connects as it would on Windows.
 
